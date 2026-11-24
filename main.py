@@ -403,6 +403,8 @@ def main() -> None:
     api_key = _require_env("DEEPSEEK_API_KEY")
     store = Store(DATA_DIR / "oniya.db", TZ)
     log.info("データの保存先: %s", (DATA_DIR / "oniya.db").resolve())
+    # 再デプロイ後もこの件数が0に戻らなければ、ボリュームにデータが残っている
+    log.info("保存されている件数: %s", ", ".join(f"{k} {v}" for k, v in store.counts().items()))
     deepseek = DeepSeek(api_key, store, load_llm_config(), load_profile(PROFILE))
     create_bot(deepseek, store).run(token, log_handler=None)
 

@@ -342,6 +342,17 @@ class Store:
             created_at=r["created_at"],
         )
 
+    def counts(self) -> dict[str, int]:
+        """保存されている件数を返す（起動時のログ用。ボリュームにデータが残っているかの確認に使う）。"""
+        q = lambda sql: self.db.execute(sql).fetchone()[0]
+        return {
+            "発言": q("SELECT COUNT(*) FROM messages"),
+            "記憶": q("SELECT COUNT(*) FROM memories WHERE kind = 'fact'"),
+            "要約": q("SELECT COUNT(*) FROM memories WHERE kind = 'summary'"),
+            "リマインダー": q("SELECT COUNT(*) FROM reminders"),
+            "予定": q("SELECT COUNT(*) FROM events"),
+        }
+
     def recent_messages(self, channel_id: int, limit: int, since: int | None = None) -> list[LoggedMessage]:
         """チャンネルの直近の発言を古い順に返す。since を指定するとその時刻以降だけにする。"""
         rows = self.db.execute(
