@@ -26,7 +26,7 @@ from discord.ext import tasks
 from dotenv import load_dotenv
 from openai import APIStatusError, OpenAIError
 
-from llm import DeepSeek, LLMConfig
+from llm import DeepSeek, LLMConfig, history_window
 from prompts import load_profile
 from store import LoggedMessage, Store
 from tools import ToolContext
@@ -51,7 +51,10 @@ def _bool_env(name: str, default: bool) -> bool:
     return os.getenv(name, str(default)).strip().lower() in {"1", "true", "yes", "on"}
 
 
-CONTEXT_MESSAGES = int(os.getenv("CONTEXT_MESSAGES", "40"))  # 返事を作るときに渡す直近の発言の数
+# 返事を作るときに渡す会話の履歴。キャッシュが効くよう、履歴の始まりを固定したまま新しい発言を後ろに足していき、
+# CONTEXT_MAX 件を超えたら新しい CONTEXT_KEEP 件まで一度に減らす。
+CONTEXT_MAX = int(os.getenv("CONTEXT_MAX", "60"))
+CONTEXT_KEEP = int(os.getenv("CONTEXT_KEEP", "30"))
 CONVERSATION_TIMEOUT = int(os.getenv("CONVERSATION_TIMEOUT", "600"))  # 秒
 LOG_RETENTION_DAYS = int(os.getenv("LOG_RETENTION_DAYS", "180"))  # 発言の記録を残す日数
 TZ = ZoneInfo(os.getenv("TZ_NAME", "Asia/Tokyo"))
@@ -74,6 +77,7 @@ class ChannelState:
     guild_id: int
     active_until: float = 0.0
     session_start: int | None = None  # 今の会話が始まった時刻（UNIX 時間）。会話中でなければ None
+    history_from: int | None = None  # DeepSeek に渡す履歴の最初の発言の ID
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def is_active(self) -> bool:
@@ -172,18 +176,20 @@ class OniyaBot(discord.Client):
             return
         self.backfilled.add(channel_id)
         try:
-            items = [self.to_logged(m) async for m in channel.history(limit=CONTEXT_MESSAGES)]
+            items = [self.to_logged(m) async for m in channel.history(limit=CONTEXT_MAX)]
         except discord.DiscordException:
             log.exception("過去の発言を読み込めませんでした channel=%s", channel_id)
             return
         added = self.store.log_messages(items)
         log.info("過去の発言を読み込みました channel=%s added=%d", channel_id, added)
 
-    def conversation(self, channel_id: int, upto_id: int | None = None) -> list[LoggedMessage]:
-        msgs = self.store.recent_messages(channel_id, CONTEXT_MESSAGES + 10)
+    def conversation(self, state: ChannelState, channel_id: int, upto_id: int | None = None) -> list[LoggedMessage]:
+        """DeepSeek に渡す履歴（最後が返事をする発言）を返す。履歴の始まりは state に覚えておく。"""
+        msgs = self.store.recent_messages(channel_id, CONTEXT_MAX + 10)
         if upto_id is not None:  # 返事をする発言より後の発言は含めない
             msgs = [m for m in msgs if m.id <= upto_id]
-        return msgs[-CONTEXT_MESSAGES:]
+        window, state.history_from = history_window(msgs, state.history_from, CONTEXT_MAX, CONTEXT_KEEP)
+        return window
 
     # ---- 会話 ----
     def is_addressed(self, message: discord.Message) -> bool:
@@ -209,7 +215,7 @@ class OniyaBot(discord.Client):
             user_id=message.author.id, user_name=message.author.display_name,
         )
         async with message.channel.typing():
-            text = await self.generate(state, self.conversation(message.channel.id, message.id), ctx)
+            text = await self.generate(state, self.conversation(state, message.channel.id, message.id), ctx)
         chunks = split_message(text)
         await message.reply(chunks[0], mention_author=False)  # 送った発言は on_message で記録される
         for chunk in chunks[1:]:
@@ -319,7 +325,7 @@ def create_bot(deepseek: DeepSeek, store: Store) -> OniyaBot:
                 await bot.respond(message, state)
                 return
             try:
-                reply, end = await bot.deepseek.should_reply(bot.conversation(message.channel.id, message.id))
+                reply, end = await bot.deepseek.should_reply(bot.conversation(state, message.channel.id, message.id))
             except OpenAIError:
                 log.exception("返事の要否の判定に失敗しました")
                 return
@@ -359,7 +365,7 @@ def create_bot(deepseek: DeepSeek, store: Store) -> OniyaBot:
             if interaction.channel is not None:
                 await bot.backfill(interaction.channel, channel_id)  # type: ignore[arg-type]
             store.log_message(question_msg)
-            text = await bot.generate(state, bot.conversation(channel_id), ctx)
+            text = await bot.generate(state, bot.conversation(state, channel_id), ctx)
         for chunk in split_message(text):
             await interaction.followup.send(chunk)
 

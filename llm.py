@@ -98,15 +98,42 @@ def format_transcript(messages: list[LoggedMessage], store: Store, self_name: st
     return "\n".join(format_line(m, store, self_name) for m in messages)
 
 
+def history_window(
+    messages: list[LoggedMessage], start_id: int | None, max_count: int, keep: int
+) -> tuple[list[LoggedMessage], int | None]:
+    """渡す履歴を選ぶ。(履歴, 次に使う履歴の始まりの発言 ID) を返す。
+
+    キャッシュは前回と同じ書き出しの部分に効くので、1件ずつずらさず、始まり（start_id）を固定したまま
+    新しい発言を後ろに足していく。max_count 件を超えたら、新しい keep 件まで一度に減らして始まりを進める。
+    始まりの発言が消された・古すぎて見つからない場合も、新しい keep 件から始め直す。
+    """
+    if not messages:
+        return [], start_id
+    ids = [m.id for m in messages]
+    if start_id in ids:
+        window = messages[ids.index(start_id):]
+        if len(window) <= max_count:
+            return window, start_id
+    window = messages[-keep:]
+    return window, window[0].id
+
+
 def build_conversation(messages: list[LoggedMessage], store: Store, self_name: str) -> str:
-    """直近の会話と、返事をする発言を1つのユーザーメッセージにまとめる。"""
+    """会話の履歴、現在の日時、返事をする発言を、この順で1つのユーザーメッセージにまとめる。
+
+    履歴は返事のたびに後ろへ伸びるだけなので、前回の履歴の部分はそのままキャッシュから再利用される。
+    毎回変わる現在の日時と返事をする発言は、最後に置く。
+    """
     if not messages:
         return "（会話なし）"
     *before, last = messages
     parts = []
     if before:
-        parts.append("# このチャンネルの直近の会話（古い順）\n" + format_transcript(before, store, self_name))
-    parts.append("# 返事をする発言\n" + format_line(last, store, self_name))
+        parts.append("# このチャンネルの会話（古い順）\n" + format_transcript(before, store, self_name))
+    now = store.now()
+    parts.append(
+        f"# 返事をする発言（現在の日時: {now:%Y-%m-%d %H:%M}（{store.tz}））\n" + format_line(last, store, self_name)
+    )
     return "\n\n".join(parts)
 
 
@@ -125,10 +152,21 @@ class DeepSeek:
 
     # ---- プロンプトの組み立て ----
     def system_prompt(self, ctx: ToolContext) -> str:
-        now = self.store.now()
-        values = {"name": self.name, "now": f"{now:%Y-%m-%d %H:%M}", "tz": str(self.store.tz), "model": self.cfg.model}
-        parts = [load(PROMPTS_DIR / "RULES.md", **values)]
+        """変わらない部分のシステムの指示（1. 人格と口調、2. 道具の使い方）を返す。
 
+        DeepSeek のキャッシュは、前回と同じ書き出しの部分に効き、変わった箇所より後ろには効かない。
+        そのため変わらないものから順に送る。DeepSeek は関数の一覧（API の tools）を1つ目のシステムの指示の
+        直後に置くため、1つ目のシステムの指示には変わらないものだけを入れる。送る順番は次のとおり。
+          1. 人格と口調、共通の決まり、道具の使い方（1つ目のシステムの指示）: ファイルを書き換えない限り変わらない
+          2. 関数の一覧（API の tools）: 変わらない
+          3. サーバーの返信スタイル、共有メモリ（2つ目のシステムの指示、server_prompt()）: 設定・記憶の追加・要約で変わる
+          4. 会話の履歴（ユーザーのメッセージ）: 後ろに伸びる。上限を超えたら一度に減らす（history_window()）
+          5. 現在の日時と返事をする発言（ユーザーのメッセージの最後）: 毎回変わる
+        """
+        values = {"name": self.name, "model": self.cfg.model}
+
+        # 1. 人格と口調
+        parts = [load(PROMPTS_DIR / "RULES.md", **values)]
         soul = self.profile.soul(**values)
         if soul:
             parts.append("# 人格（口調・言い回しは「回答の書き方」よりこちらを優先する）\n\n" + soul)
@@ -139,10 +177,17 @@ class DeepSeek:
                 f"「相手」の発言に対する{self.name}の返事の例。言い回しをそのまま繰り返さず、口調・長さ・返し方の参考にする。"
                 "例の中の事実（数値や出来事）は、実際の質問への答えに使わない。\n\n" + examples
             )
+
+        # 2. 道具の使い方
+        parts.append(load(PROMPTS_DIR / "TOOLS.md", **values))
+        return "\n\n".join(parts)
+
+    def server_prompt(self, ctx: ToolContext) -> str | None:
+        """3. このサーバーの決まりと共有メモリ（変わりやすいものほど後ろ）。何もなければ None。"""
+        parts = []
         style = self.store.get_style(ctx.guild_id)
         if style:
             parts.append(f"# このサーバーでの追加の指定（人格より優先する）\n{style}")
-
         facts = self.store.list_memories(ctx.guild_id, "fact", self.cfg.fact_limit)
         if facts:
             parts.append("# 覚えていること（[id] 内容）\n" + "\n".join(f"[{m['id']}] {m['content']}" for m in facts))
@@ -152,7 +197,7 @@ class DeepSeek:
                 "# 過去の会話の要約（古い順）\n"
                 + "\n".join(f"- {self.store.fmt(m['created_at'])}: {m['content']}" for m in summaries)
             )
-        return "\n\n".join(parts)
+        return "\n\n".join(parts) or None
 
     def _tool_defs(self) -> list[dict[str, Any]]:
         if self.cfg.web_search:
@@ -171,20 +216,23 @@ class DeepSeek:
             **kwargs,
         )
         choice = res.choices[0]
+        usage = res.usage
         log.info(
-            "DeepSeek model=%s finish=%s tokens=%s tool_calls=%d",
-            res.model, choice.finish_reason, res.usage.total_tokens if res.usage else "?",
-            len(choice.message.tool_calls or []),
+            "DeepSeek model=%s finish=%s input=%s (cache_hit=%s) output=%s tool_calls=%d",
+            res.model, choice.finish_reason,
+            usage.prompt_tokens if usage else "?", getattr(usage, "prompt_cache_hit_tokens", "?"),
+            usage.completion_tokens if usage else "?", len(choice.message.tool_calls or []),
         )
         return choice
 
     # ---- 回答 ----
     async def answer(self, conversation: list[LoggedMessage], ctx: ToolContext) -> str:
         """会話の最後の発言への返事を生成する。関数の呼び出しを処理し、出力上限で止まった場合は続きを生成する。"""
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": self.system_prompt(ctx)},
-            {"role": "user", "content": build_conversation(conversation, self.store, self.name)},
-        ]
+        messages: list[dict[str, Any]] = [{"role": "system", "content": self.system_prompt(ctx)}]
+        server = self.server_prompt(ctx)
+        if server:
+            messages.append({"role": "system", "content": server})
+        messages.append({"role": "user", "content": build_conversation(conversation, self.store, self.name)})
         base = list(messages)
         tool_log: list[str] = []  # 続きの生成で使う、関数の実行結果の記録
         choice = None
@@ -231,7 +279,7 @@ class DeepSeek:
             finish = cont.finish_reason
         if finish == "length":
             text += "\n\n（出力できる文字数の上限に達したため、ここで終わっています）"
-        text, removed = filter_sources(text, "\n".join(tool_log) + "\n" + messages[1]["content"])
+        text, removed = filter_sources(text, "\n".join(tool_log) + "\n" + messages[len(base) - 1]["content"])
         if removed:
             log.warning("検索結果にない参考リンクを %d 件取り除きました", removed)
         return text.strip() or "(空の応答)"
@@ -242,7 +290,7 @@ class DeepSeek:
             model=self.cfg.model,
             messages=[
                 {"role": "system", "content": load(PROMPTS_DIR / "JUDGE.md", name=self.name)},
-                {"role": "user", "content": build_conversation(conversation[-15:], self.store, self.name)},
+                {"role": "user", "content": build_conversation(conversation, self.store, self.name)},
             ],
             max_tokens=50,
             response_format={"type": "json_object"},
