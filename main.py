@@ -140,7 +140,9 @@ class OniyaBot(discord.Client):
 
     async def setup_hook(self) -> None:
         # スラッシュコマンドを Discord に登録する（全サーバーへの反映には最大1時間ほどかかることがある）
-        await self.tree.sync()
+        synced = await self.tree.sync()
+        # Discord のアプリに反映されないときは、ここに出たコマンド名と見比べる（アプリは Ctrl+R / Cmd+R で再読み込み）
+        log.info("スラッシュコマンドを登録しました: %s", ", ".join("/" + c.name for c in synced))
         self.scheduler.start()
 
     async def close(self) -> None:
@@ -344,30 +346,6 @@ def create_bot(deepseek: DeepSeek, store: Store) -> OniyaBot:
     @bot.event
     async def on_raw_message_delete(payload: discord.RawMessageDeleteEvent) -> None:
         store.delete_message(payload.message_id)
-
-    @bot.tree.command(name="ask", description="質問する")
-    @app_commands.describe(question="質問の内容")
-    async def ask_command(interaction: discord.Interaction, question: str) -> None:
-        await interaction.response.defer(thinking=True)  # 3秒以内に応答しないと失敗扱いになるため先に保留する
-        channel_id = interaction.channel_id or 0
-        state = bot.state(channel_id, interaction.guild_id or 0)
-        ctx = ToolContext(
-            guild_id=state.guild_id, channel_id=channel_id,
-            user_id=interaction.user.id, user_name=interaction.user.display_name,
-        )
-        # スラッシュコマンドの質問は通常の発言として残らないので、記録に加えてから答える
-        question_msg = LoggedMessage(
-            id=interaction.id, guild_id=state.guild_id, channel_id=channel_id, author_id=interaction.user.id,
-            author_name=interaction.user.display_name, is_bot=False, is_self=False,
-            content=f"/ask {question}", reply_author=None, reply_content=None, created_at=int(time.time()),
-        )
-        async with state.lock:
-            if interaction.channel is not None:
-                await bot.backfill(interaction.channel, channel_id)  # type: ignore[arg-type]
-            store.log_message(question_msg)
-            text = await bot.generate(state, bot.conversation(state, channel_id), ctx)
-        for chunk in split_message(text):
-            await interaction.followup.send(chunk)
 
     @bot.tree.command(name="reset", description="このチャンネルでの会話を終える")
     async def reset_command(interaction: discord.Interaction) -> None:
