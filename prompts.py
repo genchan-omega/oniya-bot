@@ -46,6 +46,27 @@ class Profile:
         lines = [line for line in text.splitlines() if "TODO" not in line]
         return _drop_empty_sections("\n".join(lines))
 
+    def examples(self, **values: str) -> str:
+        """examples/ にある返事の例（few-shot）を、ファイル名の順につなげて返す。
+
+        1つの例は「- 相手:」で始まる箇条書きで、TODO を含む例はまるごと渡さない。
+        examples/ の直下の .md だけを読み、サブフォルダ（例: examples/few-shot/ の配信の書き起こし）は読まない。
+        書き起こしは例を作るための元データで、DeepSeek には送らない。
+        """
+        folder = self.dir / "examples"
+        if not folder.is_dir():
+            return ""
+        parts = []
+        for path in sorted(folder.glob("*.md")):
+            text = load(path, **{**values, "name": self.name})
+            # 「- 相手:」と「## 見出し」の行の直前で区切り、TODO を含む例を取り除く
+            blocks = re.split(r"(?m)^(?=- 相手[:：]|## )", text)
+            kept = [b for b in blocks if not (b.startswith("- 相手") and "TODO" in b)]
+            part = _drop_empty_sections("".join(kept))
+            if re.search(r"(?m)^- 相手[:：]", part):
+                parts.append(part)
+        return "\n\n".join(parts)
+
 
 def _drop_empty_sections(text: str) -> str:
     """箇条書きが1つもない「## 見出し」の節を取り除く（TODO を消した後に見出しだけ残るのを防ぐ）。"""

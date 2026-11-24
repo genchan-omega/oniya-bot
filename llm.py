@@ -46,6 +46,32 @@ FINAL_ANSWER_NOTE = (
 )
 
 
+URL_RE = re.compile(r"https?://[^\s\"'<>\\）)」』]+")
+
+
+def _norm_url(url: str) -> str:
+    return url.rstrip("/.,、。").lower()
+
+
+def filter_sources(text: str, allowed_text: str) -> tuple[str, int]:
+    """「<URL>」の形で書かれた参考リンクのうち、検索結果・読んだページ・会話に出てこない URL の行を取り除く。
+
+    モデルが検索せずに、それらしい URL を作ってしまうことがあるため。取り除いた行数も返す。
+    """
+    allowed = {_norm_url(u) for u in URL_RE.findall(allowed_text)}
+    lines, removed = [], 0
+    for line in text.splitlines():
+        cited = re.findall(r"<(https?://[^>\s]+)>", line)
+        if cited and any(_norm_url(u) not in allowed for u in cited):
+            removed += 1
+            continue
+        lines.append(line)
+    out = "\n".join(lines)
+    # 参考リンクが1つも残らなかった場合は「参考:」の見出しも消す
+    out = re.sub(r"\n*参考[:：]\s*$", "", out.rstrip())
+    return out, removed
+
+
 def strip_tool_markup(text: str) -> str:
     """関数呼び出しの記法が始まる位置より後を取り除く。"""
     m = TOOL_MARKUP.search(text)
@@ -106,6 +132,13 @@ class DeepSeek:
         soul = self.profile.soul(**values)
         if soul:
             parts.append("# 人格（口調・言い回しは「回答の書き方」よりこちらを優先する）\n\n" + soul)
+        examples = self.profile.examples(**values)
+        if examples:
+            parts.append(
+                f"# {self.name}の返事の例\n"
+                f"「相手」の発言に対する{self.name}の返事の例。言い回しをそのまま繰り返さず、口調・長さ・返し方の参考にする。"
+                "例の中の事実（数値や出来事）は、実際の質問への答えに使わない。\n\n" + examples
+            )
         style = self.store.get_style(ctx.guild_id)
         if style:
             parts.append(f"# このサーバーでの追加の指定（人格より優先する）\n{style}")
@@ -198,6 +231,9 @@ class DeepSeek:
             finish = cont.finish_reason
         if finish == "length":
             text += "\n\n（出力できる文字数の上限に達したため、ここで終わっています）"
+        text, removed = filter_sources(text, "\n".join(tool_log) + "\n" + messages[1]["content"])
+        if removed:
+            log.warning("検索結果にない参考リンクを %d 件取り除きました", removed)
         return text.strip() or "(空の応答)"
 
     async def should_reply(self, conversation: list[LoggedMessage]) -> tuple[bool, bool]:
