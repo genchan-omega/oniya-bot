@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import re
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -29,11 +30,26 @@ class LLMConfig:
     model: str = "deepseek-flash"
     max_tokens: int = 16384
     max_continuations: int = 3
-    max_tool_rounds: int = 8
+    max_tool_rounds: int = 6
     thinking: bool = False
     web_search: bool = True
     fact_limit: int = 100  # システムの指示に入れる記憶の最大件数
     summary_limit: int = 10  # システムの指示に入れる過去の会話の要約の最大件数
+
+
+# DeepSeek が内部で使う関数呼び出しの記法（例: <｜DSML｜function_calls>）。通常は tool_calls として返るが、
+# 関数を渡していない呼び出しで関数を使おうとすると、本文に文字として出てくることがある。
+TOOL_MARKUP = re.compile(r"<[|｜]+\s*DSML\s*[|｜]+")
+FINAL_ANSWER_NOTE = (
+    "これ以上、関数は使えません。ここまでに得た情報だけで、質問に答えてください。"
+    "分からなかった部分は、分からなかったと一言で書いてください。関数呼び出しの記法は書かないでください。"
+)
+
+
+def strip_tool_markup(text: str) -> str:
+    """関数呼び出しの記法が始まる位置より後を取り除く。"""
+    m = TOOL_MARKUP.search(text)
+    return (text[: m.start()] if m else text).strip()
 
 
 def _clip(text: str, limit: int) -> str:
@@ -151,9 +167,18 @@ class DeepSeek:
                 tool_log.append(f"## {call.function.name}({call.function.arguments})\n{result}")
         else:
             # 関数の呼び出しが上限回数まで続いた場合は、関数なしで答えさせる
-            choice = await self._create(messages, tools=False)
+            log.warning("関数の呼び出しが %d 回続いたため、関数なしで答えさせます", self.cfg.max_tool_rounds)
+            choice = await self._create([*messages, {"role": "system", "content": FINAL_ANSWER_NOTE}], tools=False)
 
         text = choice.message.content or ""
+        if TOOL_MARKUP.search(text):
+            # モデルが関数呼び出しを文字として書いてしまった場合は、関数なしでもう一度答えさせる
+            log.warning("回答に関数呼び出しの記法が含まれていたため、答え直させます")
+            retry = await self._create([*messages, {"role": "system", "content": FINAL_ANSWER_NOTE}], tools=False)
+            text = strip_tool_markup(retry.message.content or "")
+            choice = retry
+            if not text:
+                text = "調べきれませんでした。質問を具体的にしてもう一度送ってください。"
         finish = choice.finish_reason
         # 続きの生成（prefix）は関数呼び出しを含む履歴と一緒に使えないため、実行結果を文章にして渡す
         cont_base = base + (
