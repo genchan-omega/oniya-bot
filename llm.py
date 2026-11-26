@@ -15,7 +15,7 @@ from openai import APIStatusError, AsyncOpenAI
 
 from prompts import PROMPTS_DIR, Profile, load
 from store import LoggedMessage, Store
-from tools import TOOL_DEFS, ToolContext, ToolRunner
+from tools import TASK_TOOL_NAMES, TOOL_DEFS, ToolContext, ToolRunner
 
 log = logging.getLogger("oniya-bot.llm")
 
@@ -208,15 +208,21 @@ class DeepSeek:
             )
         return "\n\n".join(parts) or None
 
-    def _tool_defs(self) -> list[dict[str, Any]]:
-        if self.cfg.web_search:
-            return TOOL_DEFS
-        return [t for t in TOOL_DEFS if t["function"]["name"] not in {"web_search", "read_url"}]
+    def _tool_defs(self, names: set[str] | None = None) -> list[dict[str, Any]]:
+        """渡す関数の一覧。names を指定すると、その関数だけにする。"""
+        defs = TOOL_DEFS
+        if not self.cfg.web_search:
+            defs = [t for t in defs if t["function"]["name"] not in {"web_search", "read_url"}]
+        if names is not None:
+            defs = [t for t in defs if t["function"]["name"] in names]
+        return defs
 
-    async def _create(self, messages: list[dict[str, Any]], *, tools: bool, beta: bool = False) -> Any:
+    async def _create(
+        self, messages: list[dict[str, Any]], *, tools: list[dict[str, Any]] | None, beta: bool = False
+    ) -> Any:
         kwargs: dict[str, Any] = {}
         if tools:
-            kwargs["tools"] = self._tool_defs()
+            kwargs["tools"] = tools
         res = await (self.beta if beta else self.client).chat.completions.create(
             model=self.cfg.model,
             messages=messages,
@@ -242,11 +248,18 @@ class DeepSeek:
         if server:
             messages.append({"role": "system", "content": server})
         messages.append({"role": "user", "content": build_conversation(conversation, self.store, self.name)})
+        return await self._complete(messages, ctx, self._tool_defs())
+
+    async def _complete(self, messages: list[dict[str, Any]], ctx: ToolContext, tools: list[dict[str, Any]]) -> str:
+        """関数の呼び出しを繰り返して回答を作る。出力上限で止まった場合は続きを生成する。
+
+        messages の最後はユーザーのメッセージ（会話や、実行する予定の内容）にする。
+        """
         base = list(messages)
         tool_log: list[str] = []  # 続きの生成で使う、関数の実行結果の記録
         choice = None
         for _ in range(self.cfg.max_tool_rounds):
-            choice = await self._create(messages, tools=True)
+            choice = await self._create(messages, tools=tools)
             calls = choice.message.tool_calls or []
             if not calls:
                 break
@@ -258,13 +271,13 @@ class DeepSeek:
         else:
             # 関数の呼び出しが上限回数まで続いた場合は、関数なしで答えさせる
             log.warning("関数の呼び出しが %d 回続いたため、関数なしで答えさせます", self.cfg.max_tool_rounds)
-            choice = await self._create([*messages, {"role": "system", "content": FINAL_ANSWER_NOTE}], tools=False)
+            choice = await self._create([*messages, {"role": "system", "content": FINAL_ANSWER_NOTE}], tools=None)
 
         text = choice.message.content or ""
         if TOOL_MARKUP.search(text):
             # モデルが関数呼び出しを文字として書いてしまった場合は、関数なしでもう一度答えさせる
             log.warning("回答に関数呼び出しの記法が含まれていたため、答え直させます")
-            retry = await self._create([*messages, {"role": "system", "content": FINAL_ANSWER_NOTE}], tools=False)
+            retry = await self._create([*messages, {"role": "system", "content": FINAL_ANSWER_NOTE}], tools=None)
             text = strip_tool_markup(retry.message.content or "")
             choice = retry
             if not text:
@@ -279,7 +292,7 @@ class DeepSeek:
                 break
             try:
                 cont = await self._create(
-                    [*cont_base, {"role": "assistant", "content": text, "prefix": True}], tools=False, beta=True
+                    [*cont_base, {"role": "assistant", "content": text, "prefix": True}], tools=None, beta=True
                 )
             except APIStatusError as e:
                 log.warning("続きの生成に失敗しました (%s): %s", e.status_code, e.message)
@@ -403,3 +416,25 @@ class DeepSeek:
             if uid in people and isinstance(note, str) and note.strip() and note.strip() != (people[uid][1] or ""):
                 out[uid] = note.strip()[:400]
         return out
+
+    # ---- 予定のタスク ----
+    async def run_task(self, ctx: ToolContext, *, instruction: str, owner: str, registered_at: int, repeat: str) -> str | None:
+        """登録しておいたタスクを、その時刻に関数を使って実行し、投稿する文章を返す。投稿しない場合は None。"""
+        messages: list[dict[str, Any]] = [{"role": "system", "content": self.system_prompt(ctx)}]
+        server = self.server_prompt(ctx)
+        if server:
+            messages.append({"role": "system", "content": server})
+        messages.append({"role": "system", "content": load(PROMPTS_DIR / "TASK.md", name=self.name)})
+        now = self.store.now()
+        messages.append({
+            "role": "user",
+            "content": (
+                f"# 実行する予定\n{instruction}\n\n"
+                f"- 頼んだ人: 〈{owner}〉\n- 登録した日時: {self.store.fmt(registered_at)}\n- 繰り返し: {repeat}\n\n"
+                f"# 現在の日時\n{now:%Y-%m-%d %H:%M}（{self.store.tz}）"
+            ),
+        })
+        text = (await self._complete(messages, ctx, self._tool_defs(TASK_TOOL_NAMES))).strip()
+        # メンションは bot が付けるので、モデルが書いた「<@名前>」のような偽のメンションは取り除く
+        text = re.sub(r"<@!?[^\d>][^>]*>\s*", "", text).strip()
+        return None if text in {"", "なし", "(空の応答)"} else text

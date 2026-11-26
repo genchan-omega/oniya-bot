@@ -25,6 +25,14 @@ FETCH_MAX_CHARS = 12000  # 読み取ったページのうち、モデルに渡�
 FOLLOWUP_AFTER_REMINDER_MIN = 180  # リマインダーを送ってから「ちゃんとやったか」を聞くまでの分数
 FOLLOWUP_AFTER_EVENT_MIN = 120  # 終了時刻のない予定で、開始から「どうだった」を聞くまでの分数
 NOTE_MAX_CHARS = 400  # 人物ノートの最大文字数
+TASK_MAX_REGISTRATIONS = 5  # タスクの1回の実行で登録できるリマインダー・声かけの数
+# タスク（その時刻に DeepSeek が動く予定）の実行中に使える関数。確認なしにやると困るもの（取り消し、記憶や設定の
+# 書き換え）と、さらにタスクを登録するもの（登録が止まらなくなるため）は渡さない
+TASK_TOOL_NAMES = {
+    "web_search", "read_url", "search_messages", "list_reminders", "list_events",
+    "create_reminder", "add_followup",
+}
+TASK_REGISTER_TOOLS = {"create_reminder", "add_followup"}
 
 
 @dataclass
@@ -35,6 +43,8 @@ class ToolContext:
     user_name: str
     # 渡した会話に出てくる人（bot を除く）の表示名と ID。「誰について」の名前を ID に直すのに使う
     participants: dict[str, int] = field(default_factory=dict)
+    in_task: bool = False  # タスクの実行中か（使える関数と登録できる数を制限する）
+    registered: int = 0  # この実行で登録したリマインダー・声かけの数
 
 
 def _fn(name: str, description: str, properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
@@ -96,6 +106,31 @@ TOOL_DEFS: list[dict[str, Any]] = [
             "mention_user": {"type": "boolean", "description": "依頼した人にメンションするか（既定 false）"},
         },
         ["text", "freq", "time"],
+    ),
+    _fn(
+        "schedule_task",
+        "指定した時刻に、あなた自身が関数（Web 検索、ページの読み取り、リマインダー・声かけの登録）を使って動く予定を登録する。"
+        "「明日の朝に〇〇を調べて教えて」「毎月1日に〇〇の日程を調べて、その日にリマインドして」のように、"
+        "その時刻に調べる・判断する必要がある依頼に使う。決まった文章を投稿するだけなら create_reminder か "
+        "create_recurring_post を使う。1回だけなら when を、繰り返すなら freq と time を指定する。",
+        {
+            "instruction": {
+                "type": "string",
+                "description": "その時刻に実行することの指示。後で読んで分かるよう、調べる対象、使うサイト、"
+                "結果をどうするか（報告する、何日の何時にリマインダーを登録する等）を具体的に書く。"
+                "メンションは bot が付けるので、誰にメンションするかは書かない",
+            },
+            "when": {"type": "string", "description": "1回だけ実行する日時。" + DATETIME_DESC},
+            "freq": {"type": "string", "enum": ["daily", "weekly", "monthly"], "description": "繰り返すときの周期"},
+            "time": {"type": "string", "description": "繰り返すときの時刻 'HH:MM'"},
+            "weekdays": {
+                "type": "array", "items": {"type": "integer"},
+                "description": "freq が weekly のときの曜日。0=月曜, 1=火曜, ..., 6=日曜",
+            },
+            "day_of_month": {"type": "integer", "description": "freq が monthly のときの日（1〜31）"},
+            "mention_user": {"type": "boolean", "description": "結果を投稿するとき依頼した人にメンションするか（既定 true）"},
+        },
+        ["instruction"],
     ),
     _fn(
         "search_messages",
@@ -183,6 +218,7 @@ TOOL_DEFS: list[dict[str, Any]] = [
         "人物ノート（1人につき1枚のメモ）を書き直す。人についての情報（呼び方、所属、好み、取り組み中のこと、"
         "最近の出来事）を覚えてと頼まれたとき、または今後も役に立つ情報が出たときに使う。"
         "今のノートの内容に新しい情報を合わせ、古くなった情報は消して、全文を渡す。"
+        "会話にはっきり書かれていることだけを書き、発言から推測したことは書かない。"
         "本人が自分のノートを消してと言った場合は空文字を渡す。",
         {
             "about": {"type": "string", "description": "誰のノートか（会話に出てくる表示名）。省略すると発言した本人"},
@@ -239,6 +275,13 @@ class ToolRunner:
             handler = getattr(self, f"_t_{name}", None)
             if handler is None:
                 raise ValueError(f"不明な関数です: {name}")
+            if ctx.in_task:
+                if name not in TASK_TOOL_NAMES:
+                    raise ValueError(f"予定の実行中は {name} を使えません")
+                if name in TASK_REGISTER_TOOLS:
+                    if ctx.registered >= TASK_MAX_REGISTRATIONS:
+                        raise ValueError(f"1回の実行で登録できるのは {TASK_MAX_REGISTRATIONS} 件までです")
+                    ctx.registered += 1
             result = await handler(args, ctx)
         except Exception as e:  # モデルに失敗を伝えて、言い直しや説明をさせる
             log.warning("ツール %s の実行に失敗しました: %s", name, e)
@@ -288,7 +331,7 @@ class ToolRunner:
             raise ValueError("過去の日時は指定できません")
         rid = self.store.add_reminder(
             guild_id=ctx.guild_id, channel_id=ctx.channel_id, user_id=ctx.user_id, text=a["text"],
-            due_at=due, mention_user=bool(a.get("mention_user", True)),
+            due_at=due, mention_user=bool(a.get("mention_user", True)), depth=int(ctx.in_task),
         )
         out: dict[str, Any] = {"ok": True, "id": rid, "when": self.store.fmt(due)}
         if a.get("follow_up", True):
@@ -313,6 +356,38 @@ class ToolRunner:
             due_at=int(first.timestamp()), rule=rule, mention_user=bool(a.get("mention_user", False)),
         )
         return {"ok": True, "id": rid, "repeat": rule.describe(), "first": self.store.fmt(int(first.timestamp()))}
+
+    async def _t_schedule_task(self, a: dict[str, Any], ctx: ToolContext) -> Any:
+        instruction = str(a.get("instruction") or "").strip()
+        if not instruction:
+            raise ValueError("指示が空です")
+        mention = bool(a.get("mention_user", True))
+        if a.get("freq"):
+            if not a.get("time"):
+                raise ValueError("繰り返す場合は time を指定してください")
+            hour, minute = (int(x) for x in str(a["time"]).split(":"))
+            rule = Rule(
+                freq=a["freq"], hour=hour, minute=minute,
+                weekdays=a.get("weekdays") if a["freq"] == "weekly" else None,
+                day_of_month=a.get("day_of_month") if a["freq"] == "monthly" else None,
+            )
+            rule.validate()
+            due = int(rule.next_after(self.store.now()).timestamp())
+        elif a.get("when"):
+            rule = None
+            due = self.store.parse_local(a["when"])
+            if due <= self.store.now().timestamp():
+                raise ValueError("過去の日時は指定できません")
+        else:
+            raise ValueError("when（1回だけ）か freq と time（繰り返し）を指定してください")
+        rid = self.store.add_reminder(
+            guild_id=ctx.guild_id, channel_id=ctx.channel_id, user_id=ctx.user_id, text=instruction,
+            due_at=due, rule=rule, mention_user=mention, mode="task",
+        )
+        return {
+            "ok": True, "id": rid, "first": self.store.fmt(due),
+            "repeat": rule.describe() if rule else "なし（1回だけ）",
+        }
 
     async def _t_list_reminders(self, a: dict[str, Any], ctx: ToolContext) -> Any:
         return self.store.list_reminders(ctx.guild_id)

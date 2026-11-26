@@ -31,7 +31,7 @@ from openai import APIStatusError, OpenAIError
 
 from llm import DeepSeek, LLMConfig, history_window
 from prompts import load_profile
-from store import LoggedMessage, Store
+from store import LoggedMessage, Rule, Store
 from tools import ToolContext
 
 load_dotenv()
@@ -150,6 +150,7 @@ class OniyaBot(discord.Client):
         self.store = store
         self.channels: dict[int, ChannelState] = {}
         self.backfilled: set[int] = set()  # 起動後に過去の発言を読み込んだチャンネル
+        self.running_tasks: set[asyncio.Task] = set()  # 実行中のタスク（schedule_task で登録した予定）
 
     def state(self, channel_id: int, guild_id: int) -> ChannelState:
         return self.channels.setdefault(channel_id, ChannelState(guild_id=guild_id))
@@ -286,6 +287,13 @@ class OniyaBot(discord.Client):
         now_ts = int(time.time())
         # リマインダー・定期投稿
         for row in self.store.due_reminders(now_ts):
+            if row["mode"] == "task":
+                # 先に次の時刻へ進めてから、別に動かす（実行に数十秒かかっても、他のリマインダーを遅らせない）
+                self.store.finish_reminder(row)
+                job = asyncio.create_task(self.run_task(dict(row), now_ts))
+                self.running_tasks.add(job)
+                job.add_done_callback(self.running_tasks.discard)
+                continue
             prefix = f"<@{row['user_id']}> " if row["mention_user"] else ""
             late = "（bot が止まっていたため遅れて送っています）\n" if now_ts - row["due_at"] > LATE_NOTICE_SEC else ""
             label = "定期投稿" if row["rule"] else "リマインダー"
@@ -314,6 +322,34 @@ class OniyaBot(discord.Client):
             if state.session_start is not None and not state.is_active() and not state.lock.locked():
                 async with state.lock:
                     await self.end_conversation(state, channel_id)
+
+    async def run_task(self, row: dict, now_ts: int) -> None:
+        """schedule_task で登録した予定を、関数を使って実行し、結果を投稿する。"""
+        gid, uid = row["guild_id"], row["user_id"]
+        people = self.store.get_people(gid, [uid])
+        owner = people[0]["name"] if people else "頼んだ人"
+        ctx = ToolContext(
+            guild_id=gid, channel_id=row["channel_id"], user_id=uid, user_name=owner,
+            participants={owner: uid}, in_task=True,
+        )
+        repeat = Rule.from_json(row["rule"]).describe() if row["rule"] else "なし（1回だけ）"
+        prefix = f"<@{uid}> " if row["mention_user"] else ""
+        log.info("タスク %s を実行します: %s", row["id"], row["text"][:100])
+        try:
+            text = await self.deepseek.run_task(
+                ctx, instruction=row["text"], owner=owner, registered_at=row["created_at"], repeat=repeat,
+            )
+        except OpenAIError as e:
+            log.exception("タスク %s の実行に失敗しました", row["id"])
+            text = f"頼まれていた予定（{row['text'][:50]}）を実行できませんでした。{describe_api_error(e)}"
+        if text is None:
+            log.info("タスク %s は投稿することがありませんでした", row["id"])
+            return
+        late = "\n（bot が止まっていたため遅れて実行しています）" if now_ts - row["due_at"] > LATE_NOTICE_SEC else ""
+        try:
+            await self.send_to(row["channel_id"], prefix + text + late)
+        except discord.DiscordException:
+            log.exception("タスク %s の結果を送れませんでした", row["id"])
 
     def _quiet_until(self, now: datetime) -> datetime | None:
         """今が声をかけない時間帯なら、その終わりの日時を返す。"""

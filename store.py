@@ -27,6 +27,9 @@ CREATE TABLE IF NOT EXISTS reminders (
     rule TEXT,                         -- 繰り返しの規則（JSON）。NULL なら1回だけ
     active INTEGER NOT NULL DEFAULT 1,
     created_at INTEGER NOT NULL
+    -- mode, depth は後から追加した列（Store._migrate を参照）
+    --   mode: 'post' = 登録した文章をそのまま投稿する / 'task' = その時刻に DeepSeek が関数を使って動く
+    --   depth: 0 = 会話で登録した / 1 = タスクの実行中に登録した（そこからはさらに登録できない）
 );
 CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders (active, due_at);
 
@@ -206,6 +209,11 @@ class Store:
         cols = {r["name"] for r in self.db.execute("PRAGMA table_info(guild_settings)")}
         if "followup_level" not in cols:
             self.db.execute("ALTER TABLE guild_settings ADD COLUMN followup_level TEXT")
+        cols = {r["name"] for r in self.db.execute("PRAGMA table_info(reminders)")}
+        if "mode" not in cols:
+            self.db.execute("ALTER TABLE reminders ADD COLUMN mode TEXT NOT NULL DEFAULT 'post'")
+        if "depth" not in cols:
+            self.db.execute("ALTER TABLE reminders ADD COLUMN depth INTEGER NOT NULL DEFAULT 0")
 
     # ---- 時刻の変換 ----
     def parse_local(self, text: str) -> int:
@@ -227,12 +235,13 @@ class Store:
     # ---- リマインダー・定期投稿 ----
     def add_reminder(
         self, *, guild_id: int, channel_id: int, user_id: int, text: str, due_at: int,
-        rule: Rule | None = None, mention_user: bool = True,
+        rule: Rule | None = None, mention_user: bool = True, mode: str = "post", depth: int = 0,
     ) -> int:
         cur = self.db.execute(
-            "INSERT INTO reminders (guild_id, channel_id, user_id, mention_user, text, due_at, rule, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (guild_id, channel_id, user_id, int(mention_user), text, due_at, rule.to_json() if rule else None, int(time.time())),
+            "INSERT INTO reminders (guild_id, channel_id, user_id, mention_user, text, due_at, rule, created_at,"
+            " mode, depth) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (guild_id, channel_id, user_id, int(mention_user), text, due_at, rule.to_json() if rule else None,
+             int(time.time()), mode, depth),
         )
         self.db.commit()
         return int(cur.lastrowid or 0)
@@ -247,6 +256,7 @@ class Store:
         rule = Rule.from_json(r["rule"]) if r["rule"] else None
         return {
             "id": r["id"],
+            "kind": "タスク（その時刻に考えて動く）" if r["mode"] == "task" else "投稿",
             "text": r["text"],
             "next": self.fmt(r["due_at"]),
             "repeat": rule.describe() if rule else "なし（1回だけ）",
