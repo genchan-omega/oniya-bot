@@ -5,6 +5,8 @@
 - 会話中は、メンションがなくても返事が必要かどうかを判断して返事をする
 - 一定時間 bot が返事をしないか、会話が終わったと判断したら会話を終え、内容を要約して記憶する
 - Web 検索、過去の発言の検索、リマインダー、定期投稿、予定の管理、長期の記憶、返信スタイルの保存を関数呼び出しで行う
+- 会話に出た予定や宣言を「気にかけること」として登録し、その時刻に bot から本人に「どうだった？」と声をかける
+- 1人1枚の人物ノートを会話が終わるたびに書き直し、会話に出ている人の分だけ DeepSeek に渡す
 - 人格は profiles/<PROFILE>/、共通の決まりは prompts/ のファイルに書く
 - 設定値は .env から読み込む（.env.example を参照）
 """
@@ -17,6 +19,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -60,6 +63,19 @@ LOG_RETENTION_DAYS = int(os.getenv("LOG_RETENTION_DAYS", "180"))  # 発言の記
 TZ = ZoneInfo(os.getenv("TZ_NAME", "Asia/Tokyo"))
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 PROFILE = os.getenv("PROFILE", "oniya")
+
+
+def _hours_env(name: str, default: str) -> tuple[int, int]:
+    start, end = (int(x) for x in os.getenv(name, default).split("-"))
+    return start % 24, end % 24
+
+
+# 「気にかけること」の声かけ。夜中（QUIET_HOURS の間）は送らず、終わりの時刻まで遅らせる
+QUIET_HOURS = _hours_env("QUIET_HOURS", "0-8")
+# 頻度ごとの1日の上限（サーバー全体, 1人あたり）。頻度はサーバーごとに /checkin で変えられる
+FOLLOWUP_LIMITS = {"off": (0, 0), "low": (2, 1), "normal": (5, 1), "high": (10, 2)}
+FOLLOWUP_LEVEL_NAMES = {"off": "オフ", "low": "控えめ", "normal": "普通", "high": "多め"}
+FOLLOWUP_EXPIRE_SEC = 2 * 86400  # bot が止まっていたなどで、これより遅れた声かけは送らない
 
 
 def load_llm_config() -> LLMConfig:
@@ -212,12 +228,14 @@ class OniyaBot(discord.Client):
         return text
 
     async def respond(self, message: discord.Message, state: ChannelState) -> None:
+        conversation = self.conversation(state, message.channel.id, message.id)
         ctx = ToolContext(
             guild_id=state.guild_id, channel_id=message.channel.id,
             user_id=message.author.id, user_name=message.author.display_name,
+            participants={m.author_name: m.author_id for m in conversation if not m.is_bot},
         )
         async with message.channel.typing():
-            text = await self.generate(state, self.conversation(state, message.channel.id, message.id), ctx)
+            text = await self.generate(state, conversation, ctx)
         chunks = split_message(text)
         await message.reply(chunks[0], mention_author=False)  # 送った発言は on_message で記録される
         for chunk in chunks[1:]:
@@ -240,6 +258,22 @@ class OniyaBot(discord.Client):
         if summary:
             self.store.add_memory(state.guild_id, "summary", summary, None)
         log.info("会話を終了しました channel=%s summary=%s", channel_id, summary)
+        await self.update_notes(state.guild_id, session)
+
+    async def update_notes(self, guild_id: int, session: list[LoggedMessage]) -> None:
+        """会話に参加した人（bot を除く）の人物ノートを書き直す。"""
+        names = {m.author_id: m.author_name for m in session if not m.is_bot}
+        rows = {r["user_id"]: r["note"] for r in self.store.get_people(guild_id, list(names))}
+        people = {uid: (name, rows.get(uid)) for uid, name in names.items()}
+        try:
+            updated = await self.deepseek.update_notes(session, people)
+        except OpenAIError:
+            log.exception("人物ノートの更新に失敗しました")
+            return
+        for uid, note in updated.items():
+            self.store.set_note(guild_id, uid, names[uid], note)
+        if updated:
+            log.info("人物ノートを更新しました: %s", ", ".join(names[u] for u in updated))
 
     async def send_to(self, channel_id: int, text: str) -> None:
         channel = self.get_channel(channel_id) or await self.fetch_channel(channel_id)
@@ -272,11 +306,77 @@ class OniyaBot(discord.Client):
             except discord.DiscordException:
                 log.exception("予定 %s の通知を送れませんでした", ev["id"])
             self.store.mark_event_notified(ev["id"])
+        # 気にかけていたことの声かけ
+        for row in self.store.due_followups(now_ts):
+            await self.send_followup(row, now_ts)
         # 時間切れになった会話を終える
         for channel_id, state in list(self.channels.items()):
             if state.session_start is not None and not state.is_active() and not state.lock.locked():
                 async with state.lock:
                     await self.end_conversation(state, channel_id)
+
+    def _quiet_until(self, now: datetime) -> datetime | None:
+        """今が声をかけない時間帯なら、その終わりの日時を返す。"""
+        start, end = QUIET_HOURS
+        h = now.hour
+        quiet = start <= h < end if start <= end else (h >= start or h < end)
+        if not quiet:
+            return None
+        until = now.replace(hour=end, minute=0, second=0, microsecond=0)
+        return until if until > now else until + timedelta(days=1)
+
+    async def send_followup(self, row, now_ts: int) -> None:  # row は followups の1行
+        fid, gid, uid = row["id"], row["guild_id"], row["user_id"]
+        level = self.store.get_followup_level(gid)
+        if level == "off" or not self.store.wants_followups(gid, uid):
+            self.store.finish_followup(fid, "skipped")
+            return
+        if now_ts - row["check_at"] > FOLLOWUP_EXPIRE_SEC:
+            self.store.finish_followup(fid, "expired")
+            return
+        now = self.store.now()
+        quiet_end = self._quiet_until(now)
+        if quiet_end is not None:
+            self.store.postpone_followup(fid, int(quiet_end.timestamp()))
+            return
+        # 1日の上限に達していたら、翌日の朝に回す
+        day_start = int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+        guild_cap, person_cap = FOLLOWUP_LIMITS.get(level, FOLLOWUP_LIMITS["normal"])
+        if (self.store.sent_followups_since(gid, day_start) >= guild_cap
+                or self.store.sent_followups_since(gid, day_start, uid) >= person_cap):
+            tomorrow = now.replace(hour=QUIET_HOURS[1], minute=0, second=0, microsecond=0) + timedelta(days=1)
+            self.store.postpone_followup(fid, int(tomorrow.timestamp()))
+            return
+        state = self.state(row["channel_id"], gid)
+        if state.lock.locked():
+            return  # そのチャンネルで返事を作っている最中なら、次の回に回す
+        ctx = ToolContext(
+            guild_id=gid, channel_id=row["channel_id"], user_id=uid, user_name=row["user_name"],
+            participants={row["user_name"]: uid},
+        )
+        try:
+            text = await self.deepseek.checkin(
+                ctx, name=row["user_name"], topic=row["topic"], context=row["context"],
+                registered_at=row["created_at"],
+                since_lines=self.store.messages_by(row["channel_id"], uid, row["created_at"]),
+            )
+        except OpenAIError:
+            log.exception("声かけ %s の文章を作れませんでした", fid)
+            self.store.postpone_followup(fid, now_ts + 1800)
+            return
+        if text is None:
+            self.store.finish_followup(fid, "skipped")
+            log.info("声かけ %s（%s）は不要と判断しました", fid, row["topic"])
+            return
+        try:
+            await self.send_to(row["channel_id"], f"<@{uid}> {text}")
+        except discord.DiscordException:
+            log.exception("声かけ %s を送れませんでした", fid)
+            self.store.finish_followup(fid, "skipped")
+            return
+        self.store.finish_followup(fid, "sent")
+        state.extend(now_ts)  # 返信しなくても答えられるよう、そのチャンネルを会話中にする
+        log.info("声かけ %s を送りました: %s", fid, row["topic"])
 
     @tasks.loop(hours=24)
     async def pruner(self) -> None:
@@ -313,6 +413,8 @@ def create_bot(deepseek: DeepSeek, store: Store) -> OniyaBot:
         # 自分や他の bot の発言も含めて、全て記録する
         if message.type in (discord.MessageType.default, discord.MessageType.reply, discord.MessageType.chat_input_command):
             store.log_message(bot.to_logged(message))
+            if not message.author.bot and message.guild:
+                store.touch_person(message.guild.id, message.author.id, message.author.display_name)
         if message.author.bot or not message_text(message):
             return
 
@@ -366,7 +468,36 @@ def create_bot(deepseek: DeepSeek, store: Store) -> OniyaBot:
             [f"[{m['id']}] {store.fmt(m['created_at'])}: {m['content']}" for m in summaries] or ["（なし）"]
         )
         lines += ["", "**このサーバーでの追加の指定**", style or "（なし）"]
-        lines += ["", "消したい項目は「[id] を忘れて」と bot に頼んでください。"]
+        mine = store.get_people(gid, [interaction.user.id])
+        lines += ["", "**あなたの人物ノート**", (mine[0]["note"] if mine and mine[0]["note"] else None) or "（なし）"]
+        lines += ["", "消したい項目は「[id] を忘れて」「俺のノート消して」と bot に頼んでください。"]
+        chunks = split_message("\n".join(lines))
+        await interaction.response.send_message(chunks[0], ephemeral=True)
+        for chunk in chunks[1:]:
+            await interaction.followup.send(chunk, ephemeral=True)
+
+    @bot.tree.command(name="checkin", description="bot から声をかける「気にかけること」の一覧と頻度")
+    @app_commands.describe(level="声をかける頻度（変更にはサーバー管理の権限が要る）")
+    @app_commands.choices(level=[app_commands.Choice(name=v, value=k) for k, v in FOLLOWUP_LEVEL_NAMES.items()])
+    async def checkin_command(interaction: discord.Interaction, level: app_commands.Choice[str] | None = None) -> None:
+        gid = interaction.guild_id or 0
+        perms = getattr(interaction.user, "guild_permissions", None)
+        notice = ""
+        if level is not None:
+            if perms is None or not perms.manage_guild:
+                notice = "頻度を変えるにはサーバー管理の権限が必要です。\n\n"
+            else:
+                store.set_followup_level(gid, level.value)
+                notice = f"声かけの頻度を「{level.name}」にしました。\n\n"
+        cur = store.get_followup_level(gid)
+        guild_cap, person_cap = FOLLOWUP_LIMITS[cur]
+        items = store.list_followups(gid)
+        lines = [
+            notice + f"**声かけの頻度**: {FOLLOWUP_LEVEL_NAMES[cur]}（1日にサーバー全体で{guild_cap}回、1人{person_cap}回まで。"
+            f"{QUIET_HOURS[0]}〜{QUIET_HOURS[1]}時は送らない）",
+            "", "**気にかけていること**",
+        ] + ([f"[{f['id']}] {f['when']} {f['who']}: {f['topic']}" for f in items] or ["（なし）"])
+        lines += ["", "声をかけてほしくない場合は「そういうのいらない」と bot に言ってください。"]
         chunks = split_message("\n".join(lines))
         await interaction.response.send_message(chunks[0], ephemeral=True)
         for chunk in chunks[1:]:

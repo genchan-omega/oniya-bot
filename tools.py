@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any
 
@@ -22,6 +22,9 @@ log = logging.getLogger("oniya-bot.tools")
 SEARCH_URL = "https://api.deepseek.com/v1/tools/search"
 FETCH_URL = "https://api.deepseek.com/v1/tools/fetch"
 FETCH_MAX_CHARS = 12000  # 読み取ったページのうち、モデルに渡す最大文字数
+FOLLOWUP_AFTER_REMINDER_MIN = 180  # リマインダーを送ってから「ちゃんとやったか」を聞くまでの分数
+FOLLOWUP_AFTER_EVENT_MIN = 120  # 終了時刻のない予定で、開始から「どうだった」を聞くまでの分数
+NOTE_MAX_CHARS = 400  # 人物ノートの最大文字数
 
 
 @dataclass
@@ -30,6 +33,8 @@ class ToolContext:
     channel_id: int
     user_id: int
     user_name: str
+    # 渡した会話に出てくる人（bot を除く）の表示名と ID。「誰について」の名前を ID に直すのに使う
+    participants: dict[str, int] = field(default_factory=dict)
 
 
 def _fn(name: str, description: str, properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
@@ -68,6 +73,11 @@ TOOL_DEFS: list[dict[str, Any]] = [
             "when": {"type": "string", "description": DATETIME_DESC},
             "text": {"type": "string", "description": "リマインドの内容"},
             "mention_user": {"type": "boolean", "description": "依頼した人にメンションするか（既定 true）"},
+            "follow_up": {
+                "type": "boolean",
+                "description": "リマインドの数時間後に、ちゃんとやったかを依頼した人に聞くか。"
+                "やるべきこと（提出、支払い、連絡など）なら true、単なるお知らせなら false（既定 true）",
+            },
         },
         ["when", "text"],
     ),
@@ -117,6 +127,10 @@ TOOL_DEFS: list[dict[str, Any]] = [
                 "type": "integer",
                 "description": "開始の何分前にこのチャンネルで知らせるか。知らせない場合は指定しない",
             },
+            "follow_up": {
+                "type": "boolean",
+                "description": "予定が終わった後に、登録した人にどうだったかを聞くか（既定 true）",
+            },
         },
         ["title", "start"],
     ),
@@ -131,9 +145,55 @@ TOOL_DEFS: list[dict[str, Any]] = [
     ),
     _fn("delete_event", "予定を削除する。id は list_events で確認する。", {"id": {"type": "integer"}}, ["id"]),
     _fn(
+        "add_followup",
+        "あとで本人に様子を聞くこと（気にかけること）を登録する。会話の中で、日時の見当がつく予定・締め切り・"
+        "宣言（「金曜に面接」「明日レポート出す」「来週から筋トレする」）が出たときに使う。"
+        "登録した時刻に、あなたが本人に「どうだった？」「ちゃんとやったか？」と声をかける。"
+        "体調・病気・家族・恋愛・お金の悩みなど立ち入った話題や、冗談・仮定の話では登録しない。"
+        "登録したことは返信に書かない。",
+        {
+            "topic": {"type": "string", "description": "何について聞くか。日付を入れる（例: 11/27(金)の面接、11/30締め切りのレポート提出）"},
+            "when": {
+                "type": "string",
+                "description": "声をかける日時。その予定が終わった頃にする（例: 面接が午後なら同じ日の20:00、"
+                "締め切りならその少し後）。" + DATETIME_DESC,
+            },
+            "about": {"type": "string", "description": "誰に聞くか（会話に出てくる表示名）。省略すると発言した本人"},
+            "context": {"type": "string", "description": "きっかけになった発言の要点（1文）"},
+        },
+        ["topic", "when"],
+    ),
+    _fn("list_followups", "このサーバーで登録されている「気にかけること」の一覧を取得する。", {}, []),
+    _fn(
+        "cancel_followup",
+        "「気にかけること」を取り消す。予定がなくなった、もう終わって報告を受けた、と分かったときに使う。"
+        "id は list_followups で確認する。",
+        {"id": {"type": "integer"}},
+        ["id"],
+    ),
+    _fn(
+        "set_followups_for_me",
+        "発言した本人が、あなたからの声かけ（「どうだった？」など）を受けるかを設定する。"
+        "「そういうのいらない」「聞かないで」と言われたら false、「また聞いて」と言われたら true にする。",
+        {"enabled": {"type": "boolean"}},
+        ["enabled"],
+    ),
+    _fn(
+        "update_person_note",
+        "人物ノート（1人につき1枚のメモ）を書き直す。人についての情報（呼び方、所属、好み、取り組み中のこと、"
+        "最近の出来事）を覚えてと頼まれたとき、または今後も役に立つ情報が出たときに使う。"
+        "今のノートの内容に新しい情報を合わせ、古くなった情報は消して、全文を渡す。"
+        "本人が自分のノートを消してと言った場合は空文字を渡す。",
+        {
+            "about": {"type": "string", "description": "誰のノートか（会話に出てくる表示名）。省略すると発言した本人"},
+            "note": {"type": "string", "description": f"ノートの全文（{NOTE_MAX_CHARS}字以内、箇条書き）"},
+        },
+        ["note"],
+    ),
+    _fn(
         "remember",
-        "後の会話でも使う情報を長期の記憶に保存する。人についての情報は、誰のことかを名前で書く。"
-        "覚えてと頼まれたとき、または今後も役に立つ情報（好み、所属、進行中の作業、決まったこと）が出たときに使う。",
+        "後の会話でも使う、サーバー全体に関わる情報を長期の記憶に保存する（決まったこと、内輪のルール、恒例の行事など）。"
+        "特定の人についての情報は update_person_note を使う。",
         {"content": {"type": "string", "description": "保存する内容（1〜2文）"}},
         ["content"],
     ),
@@ -230,7 +290,14 @@ class ToolRunner:
             guild_id=ctx.guild_id, channel_id=ctx.channel_id, user_id=ctx.user_id, text=a["text"],
             due_at=due, mention_user=bool(a.get("mention_user", True)),
         )
-        return {"ok": True, "id": rid, "when": self.store.fmt(due)}
+        out: dict[str, Any] = {"ok": True, "id": rid, "when": self.store.fmt(due)}
+        if a.get("follow_up", True):
+            self.store.add_followup(
+                guild_id=ctx.guild_id, channel_id=ctx.channel_id, user_id=ctx.user_id, user_name=ctx.user_name,
+                topic=a["text"], check_at=due + FOLLOWUP_AFTER_REMINDER_MIN * 60,
+                context=f"{self.store.fmt(due)} にリマインドした内容", source=f"reminder:{rid}", created_by=ctx.user_id,
+            )
+        return out
 
     async def _t_create_recurring_post(self, a: dict[str, Any], ctx: ToolContext) -> Any:
         hour, minute = (int(x) for x in str(a["time"]).split(":"))
@@ -251,7 +318,10 @@ class ToolRunner:
         return self.store.list_reminders(ctx.guild_id)
 
     async def _t_cancel_reminder(self, a: dict[str, Any], ctx: ToolContext) -> Any:
-        return {"ok": self.store.cancel_reminder(ctx.guild_id, int(a["id"]))}
+        ok = self.store.cancel_reminder(ctx.guild_id, int(a["id"]))
+        if ok:
+            self.store.cancel_followups_from(f"reminder:{int(a['id'])}")
+        return {"ok": ok}
 
     # ---- 予定 ----
     async def _t_add_event(self, a: dict[str, Any], ctx: ToolContext) -> Any:
@@ -265,6 +335,13 @@ class ToolRunner:
             start_at=start, end_at=end, location=a.get("location"), notes=a.get("notes"),
             notify_before_min=int(notify) if notify is not None else None,
         )
+        if a.get("follow_up", True):
+            self.store.add_followup(
+                guild_id=ctx.guild_id, channel_id=ctx.channel_id, user_id=ctx.user_id, user_name=ctx.user_name,
+                topic=a["title"], check_at=end if end else start + FOLLOWUP_AFTER_EVENT_MIN * 60,
+                context=f"{self.store.fmt(start)} からの予定" + (f"（場所: {a['location']}）" if a.get("location") else ""),
+                source=f"event:{eid}", created_by=ctx.user_id,
+            )
         return {"ok": True, "id": eid, "start": self.store.fmt(start)}
 
     async def _t_list_events(self, a: dict[str, Any], ctx: ToolContext) -> Any:
@@ -275,7 +352,59 @@ class ToolRunner:
         return self.store.list_events(ctx.guild_id, start, end)
 
     async def _t_delete_event(self, a: dict[str, Any], ctx: ToolContext) -> Any:
-        return {"ok": self.store.delete_event(ctx.guild_id, int(a["id"]))}
+        ok = self.store.delete_event(ctx.guild_id, int(a["id"]))
+        if ok:
+            self.store.cancel_followups_from(f"event:{int(a['id'])}")
+        return {"ok": ok}
+
+    # ---- 人 ----
+    def _resolve(self, about: Any, ctx: ToolContext) -> tuple[int, str]:
+        """「誰について」の表示名を (ID, 表示名) にする。省略されたら発言した本人。"""
+        name = str(about or "").strip().lstrip("@")
+        if not name or name == ctx.user_name:
+            return ctx.user_id, ctx.user_name
+        for n, uid in ctx.participants.items():
+            if n.lower() == name.lower():
+                return uid, n
+        partial = [(n, uid) for n, uid in ctx.participants.items() if name.lower() in n.lower()]
+        if len(partial) == 1:
+            return partial[0][1], partial[0][0]
+        row = self.store.find_person(ctx.guild_id, name)
+        if row:
+            return row["user_id"], row["name"]
+        known = "、".join(ctx.participants) or "なし"
+        raise ValueError(f"「{name}」が誰か分かりません。会話に出てくる人: {known}")
+
+    # ---- 気にかけること ----
+    async def _t_add_followup(self, a: dict[str, Any], ctx: ToolContext) -> Any:
+        when = self.store.parse_local(a["when"])
+        if when <= self.store.now().timestamp():
+            raise ValueError("過去の日時は指定できません")
+        uid, name = self._resolve(a.get("about"), ctx)
+        if not self.store.wants_followups(ctx.guild_id, uid):
+            return {"ok": False, "reason": f"{name} は声かけを受けない設定にしています"}
+        fid = self.store.add_followup(
+            guild_id=ctx.guild_id, channel_id=ctx.channel_id, user_id=uid, user_name=name,
+            topic=str(a["topic"]), check_at=when, context=a.get("context"), created_by=ctx.user_id,
+        )
+        return {"ok": True, "id": fid, "who": name, "when": self.store.fmt(when)}
+
+    async def _t_list_followups(self, a: dict[str, Any], ctx: ToolContext) -> Any:
+        return self.store.list_followups(ctx.guild_id)
+
+    async def _t_cancel_followup(self, a: dict[str, Any], ctx: ToolContext) -> Any:
+        return {"ok": self.store.cancel_followup(ctx.guild_id, int(a["id"]))}
+
+    async def _t_set_followups_for_me(self, a: dict[str, Any], ctx: ToolContext) -> Any:
+        enabled = bool(a.get("enabled"))
+        cancelled = self.store.set_no_followups(ctx.guild_id, ctx.user_id, ctx.user_name, not enabled)
+        return {"ok": True, "enabled": enabled, "cancelled": cancelled}
+
+    async def _t_update_person_note(self, a: dict[str, Any], ctx: ToolContext) -> Any:
+        uid, name = self._resolve(a.get("about"), ctx)
+        note = str(a.get("note") or "").strip()[:NOTE_MAX_CHARS]
+        self.store.set_note(ctx.guild_id, uid, name, note or None)
+        return {"ok": True, "who": name, "cleared": not note}
 
     # ---- 記憶・返信スタイル ----
     async def _t_remember(self, a: dict[str, Any], ctx: ToolContext) -> Any:

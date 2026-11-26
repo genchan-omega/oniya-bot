@@ -159,7 +159,8 @@ class DeepSeek:
         直後に置くため、1つ目のシステムの指示には変わらないものだけを入れる。送る順番は次のとおり。
           1. 人格と口調、共通の決まり、道具の使い方（1つ目のシステムの指示）: ファイルを書き換えない限り変わらない
           2. 関数の一覧（API の tools）: 変わらない
-          3. サーバーの返信スタイル、共有メモリ（2つ目のシステムの指示、server_prompt()）: 設定・記憶の追加・要約で変わる
+          3. サーバーの返信スタイル、共有メモリ、会話に出ている人の人物ノート（2つ目のシステムの指示、server_prompt()）:
+             設定・記憶の追加・会話の終わりで変わる。人物ノートは会話に新しい人が加わったときにも変わる
           4. 会話の履歴（ユーザーのメッセージ）: 後ろに伸びる。上限を超えたら一度に減らす（history_window()）
           5. 現在の日時と返事をする発言（ユーザーのメッセージの最後）: 毎回変わる
         """
@@ -191,6 +192,14 @@ class DeepSeek:
         facts = self.store.list_memories(ctx.guild_id, "fact", self.cfg.fact_limit)
         if facts:
             parts.append("# 覚えていること（[id] 内容）\n" + "\n".join(f"[{m['id']}] {m['content']}" for m in facts))
+        # 人物ノートは、会話に出ている人の分だけ渡す。ID の順に並べ、会話中に並びが変わらないようにする
+        ids = sorted({*ctx.participants.values(), ctx.user_id})
+        notes = [r for r in self.store.get_people(ctx.guild_id, ids) if r["note"]]
+        if notes:
+            parts.append(
+                "# 人物ノート（この会話に出ている人について知っていること。〈 〉は表示名）\n"
+                + "\n\n".join(f"## 〈{r['name']}〉\n{r['note']}" for r in notes)
+            )
         summaries = self.store.list_memories(ctx.guild_id, "summary", self.cfg.summary_limit)
         if summaries:
             parts.append(
@@ -316,3 +325,81 @@ class DeepSeek:
         )
         text = (res.choices[0].message.content or "").strip()
         return None if not text or text.startswith("なし") else text
+
+    async def _plain(self, system: list[str], user: str, *, max_tokens: int, json_mode: bool = False) -> str:
+        """関数も thinking も使わない、短い生成。system は先頭から順にシステムの指示として送る。"""
+        kwargs: dict[str, Any] = {"response_format": {"type": "json_object"}} if json_mode else {}
+        res = await self.client.chat.completions.create(
+            model=self.cfg.model,
+            messages=[*({"role": "system", "content": t} for t in system), {"role": "user", "content": user}],
+            max_tokens=max_tokens,
+            extra_body={"thinking": {"type": "disabled"}},
+            **kwargs,
+        )
+        usage = res.usage
+        log.info(
+            "DeepSeek (plain) input=%s (cache_hit=%s) output=%s",
+            usage.prompt_tokens if usage else "?", getattr(usage, "prompt_cache_hit_tokens", "?"),
+            usage.completion_tokens if usage else "?",
+        )
+        return (res.choices[0].message.content or "").strip()
+
+    # ---- 気にかけること ----
+    async def checkin(
+        self, ctx: ToolContext, *, name: str, topic: str, context: str | None, registered_at: int,
+        since_lines: list[LoggedMessage],
+    ) -> str | None:
+        """登録しておいた「気にかけること」について、本人にかける一言を作る。声をかけない方がよければ None。"""
+        # 1つ目のシステムの指示は返事のときと同じにして、人格の部分にキャッシュを効かせる
+        system = [self.system_prompt(ctx)]
+        server = self.server_prompt(ctx)
+        if server:
+            system.append(server)
+        system.append(load(PROMPTS_DIR / "CHECKIN.md", name=self.name))
+        lines = format_transcript(since_lines, self.store, self.name) if since_lines else "（なし）"
+        now = self.store.now()
+        user = (
+            f"# 声をかける相手\n〈{name}〉\n\n"
+            f"# 気にかけていたこと\n{topic}\n"
+            + (f"（きっかけ: {context}）\n" if context else "")
+            + f"（登録した日時: {self.store.fmt(registered_at)}）\n\n"
+            f"# 登録した後の、このチャンネルでの〈{name}〉の発言\n{lines}\n\n"
+            f"# 現在の日時\n{now:%Y-%m-%d %H:%M}（{self.store.tz}）"
+        )
+        text = strip_tool_markup(await self._plain(system, user, max_tokens=300))
+        return None if not text or text.startswith("なし") else text
+
+    # ---- 人物ノート ----
+    async def update_notes(
+        self, session: list[LoggedMessage], people: dict[int, tuple[str, str | None]]
+    ) -> dict[int, str]:
+        """会話を読み、参加した人の人物ノートを書き直す。people は {ID: (表示名, 今のノート)}。
+
+        書き直したノートだけを {ID: ノート} で返す（変える必要がない人は含めない）。
+        """
+        if not people:
+            return {}
+        current = "\n\n".join(
+            f"## id={uid} 〈{name}〉\n{note or '（まだなし）'}" for uid, (name, note) in people.items()
+        )
+        user = (
+            "# 今の人物ノート\n" + current + "\n\n# 今回の会話（古い順）\n"
+            + format_transcript(session, self.store, self.name)
+        )
+        raw = await self._plain(
+            [load(PROMPTS_DIR / "NOTES.md", name=self.name)], user, max_tokens=1500, json_mode=True
+        )
+        try:
+            data = json.loads(raw or "{}")
+        except json.JSONDecodeError:
+            log.warning("人物ノートの出力を読めませんでした: %r", raw[:200])
+            return {}
+        out: dict[int, str] = {}
+        for key, note in (data.get("notes") or {}).items():
+            try:
+                uid = int(key)
+            except (TypeError, ValueError):
+                continue
+            if uid in people and isinstance(note, str) and note.strip() and note.strip() != (people[uid][1] or ""):
+                out[uid] = note.strip()[:400]
+        return out

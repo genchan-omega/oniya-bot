@@ -59,7 +59,37 @@ CREATE INDEX IF NOT EXISTS idx_memories_guild ON memories (guild_id, kind, creat
 CREATE TABLE IF NOT EXISTS guild_settings (
     guild_id INTEGER PRIMARY KEY,
     reply_style TEXT
+    -- followup_level は後から追加した列（Store.__init__ の _migrate を参照）
 );
+
+-- 人物ノート。サーバーのメンバー1人につき1枚。会話が終わるたびに書き直す（追記ではない）
+CREATE TABLE IF NOT EXISTS people (
+    guild_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,          -- ノートの対象の人
+    name TEXT NOT NULL,                -- 最後に見た表示名
+    note TEXT,
+    no_followups INTEGER NOT NULL DEFAULT 0,  -- 1: この人には「気にかけること」の声かけをしない
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (guild_id, user_id)
+);
+
+-- 気にかけること。決まった時刻に、bot から本人に「どうだった？」と声をかける
+CREATE TABLE IF NOT EXISTS followups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id INTEGER NOT NULL,
+    channel_id INTEGER NOT NULL,       -- 声をかけるチャンネル（その話が出たチャンネル）
+    user_id INTEGER NOT NULL,          -- 声をかける相手
+    user_name TEXT NOT NULL,
+    topic TEXT NOT NULL,               -- 何について聞くか（例: 金曜の面接）
+    context TEXT,                      -- きっかけになった発言など
+    check_at INTEGER NOT NULL,         -- 声をかける時刻
+    source TEXT,                       -- 'chat' / 'reminder:<id>' / 'event:<id>'
+    status TEXT NOT NULL DEFAULT 'pending',  -- pending / sent / skipped / cancelled / expired
+    created_by INTEGER,
+    created_at INTEGER NOT NULL,
+    sent_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_followups_due ON followups (status, check_at);
 
 -- bot が読めるチャンネルの発言の記録。返事を作るときに直近の会話として渡し、古い話は検索に使う
 CREATE TABLE IF NOT EXISTS messages (
@@ -167,8 +197,15 @@ class Store:
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
+        self._migrate()
         self.db.commit()
         self.tz = tz
+
+    def _migrate(self) -> None:
+        """前の版で作ったデータベースに、後から追加した列を足す。"""
+        cols = {r["name"] for r in self.db.execute("PRAGMA table_info(guild_settings)")}
+        if "followup_level" not in cols:
+            self.db.execute("ALTER TABLE guild_settings ADD COLUMN followup_level TEXT")
 
     # ---- 時刻の変換 ----
     def parse_local(self, text: str) -> int:
@@ -351,6 +388,8 @@ class Store:
             "要約": q("SELECT COUNT(*) FROM memories WHERE kind = 'summary'"),
             "リマインダー": q("SELECT COUNT(*) FROM reminders"),
             "予定": q("SELECT COUNT(*) FROM events"),
+            "人物ノート": q("SELECT COUNT(*) FROM people WHERE note IS NOT NULL"),
+            "気にかけること": q("SELECT COUNT(*) FROM followups WHERE status = 'pending'"),
         }
 
     def recent_messages(self, channel_id: int, limit: int, since: int | None = None) -> list[LoggedMessage]:
@@ -395,3 +434,147 @@ class Store:
             (guild_id, style),
         )
         self.db.commit()
+
+    # ---- 気にかけることの頻度 ----
+    def get_followup_level(self, guild_id: int) -> str:
+        row = self.db.execute("SELECT followup_level FROM guild_settings WHERE guild_id = ?", (guild_id,)).fetchone()
+        return (row["followup_level"] if row else None) or "normal"
+
+    def set_followup_level(self, guild_id: int, level: str) -> None:
+        self.db.execute(
+            "INSERT INTO guild_settings (guild_id, followup_level) VALUES (?, ?)"
+            " ON CONFLICT(guild_id) DO UPDATE SET followup_level = excluded.followup_level",
+            (guild_id, level),
+        )
+        self.db.commit()
+
+    # ---- 人物ノート ----
+    def touch_person(self, guild_id: int, user_id: int, name: str) -> None:
+        """表示名を記録する（ノートがまだなければ空のノートを作る）。"""
+        self.db.execute(
+            "INSERT INTO people (guild_id, user_id, name, updated_at) VALUES (?, ?, ?, ?)"
+            " ON CONFLICT(guild_id, user_id) DO UPDATE SET name = excluded.name",
+            (guild_id, user_id, name, int(time.time())),
+        )
+        self.db.commit()
+
+    def get_people(self, guild_id: int, user_ids: list[int]) -> list[sqlite3.Row]:
+        if not user_ids:
+            return []
+        marks = ",".join("?" * len(user_ids))
+        return self.db.execute(
+            f"SELECT * FROM people WHERE guild_id = ? AND user_id IN ({marks}) ORDER BY user_id",
+            (guild_id, *user_ids),
+        ).fetchall()
+
+    def list_people(self, guild_id: int) -> list[sqlite3.Row]:
+        return self.db.execute(
+            "SELECT * FROM people WHERE guild_id = ? AND note IS NOT NULL ORDER BY name", (guild_id,)
+        ).fetchall()
+
+    def find_person(self, guild_id: int, name: str) -> sqlite3.Row | None:
+        """表示名から人を探す。完全一致を優先し、なければ部分一致が1人だけのときに返す。"""
+        name = name.strip().lstrip("@")
+        rows = self.db.execute("SELECT * FROM people WHERE guild_id = ?", (guild_id,)).fetchall()
+        exact = [r for r in rows if r["name"].lower() == name.lower()]
+        if exact:
+            return exact[0]
+        partial = [r for r in rows if name and (name.lower() in r["name"].lower() or r["name"].lower() in name.lower())]
+        return partial[0] if len(partial) == 1 else None
+
+    def set_note(self, guild_id: int, user_id: int, name: str, note: str | None) -> None:
+        self.db.execute(
+            "INSERT INTO people (guild_id, user_id, name, note, updated_at) VALUES (?, ?, ?, ?, ?)"
+            " ON CONFLICT(guild_id, user_id) DO UPDATE SET name = excluded.name, note = excluded.note,"
+            " updated_at = excluded.updated_at",
+            (guild_id, user_id, name, note, int(time.time())),
+        )
+        self.db.commit()
+
+    def set_no_followups(self, guild_id: int, user_id: int, name: str, value: bool) -> int:
+        """声かけを受けない設定にする。受けない設定にした場合は、その人の残っている声かけを取り消し、件数を返す。"""
+        self.touch_person(guild_id, user_id, name)
+        self.db.execute(
+            "UPDATE people SET no_followups = ? WHERE guild_id = ? AND user_id = ?", (int(value), guild_id, user_id)
+        )
+        cancelled = 0
+        if value:
+            cancelled = self.db.execute(
+                "UPDATE followups SET status = 'cancelled' WHERE guild_id = ? AND user_id = ? AND status = 'pending'",
+                (guild_id, user_id),
+            ).rowcount
+        self.db.commit()
+        return cancelled
+
+    def wants_followups(self, guild_id: int, user_id: int) -> bool:
+        row = self.db.execute(
+            "SELECT no_followups FROM people WHERE guild_id = ? AND user_id = ?", (guild_id, user_id)
+        ).fetchone()
+        return not (row and row["no_followups"])
+
+    # ---- 気にかけること ----
+    def add_followup(
+        self, *, guild_id: int, channel_id: int, user_id: int, user_name: str, topic: str, check_at: int,
+        context: str | None = None, source: str = "chat", created_by: int | None = None,
+    ) -> int:
+        cur = self.db.execute(
+            "INSERT INTO followups (guild_id, channel_id, user_id, user_name, topic, context, check_at, source,"
+            " created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (guild_id, channel_id, user_id, user_name, topic, context, check_at, source, created_by, int(time.time())),
+        )
+        self.db.commit()
+        return int(cur.lastrowid or 0)
+
+    def list_followups(self, guild_id: int) -> list[dict[str, Any]]:
+        rows = self.db.execute(
+            "SELECT * FROM followups WHERE guild_id = ? AND status = 'pending' ORDER BY check_at", (guild_id,)
+        ).fetchall()
+        return [
+            {"id": r["id"], "who": r["user_name"], "topic": r["topic"], "when": self.fmt(r["check_at"])}
+            for r in rows
+        ]
+
+    def cancel_followup(self, guild_id: int, followup_id: int) -> bool:
+        cur = self.db.execute(
+            "UPDATE followups SET status = 'cancelled' WHERE id = ? AND guild_id = ? AND status = 'pending'",
+            (followup_id, guild_id),
+        )
+        self.db.commit()
+        return cur.rowcount > 0
+
+    def cancel_followups_from(self, source: str) -> None:
+        """リマインダーや予定を取り消したときに、そこから作った声かけも取り消す。"""
+        self.db.execute("UPDATE followups SET status = 'cancelled' WHERE source = ? AND status = 'pending'", (source,))
+        self.db.commit()
+
+    def due_followups(self, now_ts: int) -> list[sqlite3.Row]:
+        return self.db.execute(
+            "SELECT * FROM followups WHERE status = 'pending' AND check_at <= ? ORDER BY check_at", (now_ts,)
+        ).fetchall()
+
+    def sent_followups_since(self, guild_id: int, since: int, user_id: int | None = None) -> int:
+        sql = "SELECT COUNT(*) FROM followups WHERE guild_id = ? AND status = 'sent' AND sent_at >= ?"
+        params: list[Any] = [guild_id, since]
+        if user_id is not None:
+            sql += " AND user_id = ?"
+            params.append(user_id)
+        return int(self.db.execute(sql, params).fetchone()[0])
+
+    def postpone_followup(self, followup_id: int, check_at: int) -> None:
+        self.db.execute("UPDATE followups SET check_at = ? WHERE id = ?", (check_at, followup_id))
+        self.db.commit()
+
+    def finish_followup(self, followup_id: int, status: str) -> None:
+        self.db.execute(
+            "UPDATE followups SET status = ?, sent_at = ? WHERE id = ?", (status, int(time.time()), followup_id)
+        )
+        self.db.commit()
+
+    def messages_by(self, channel_id: int, user_id: int, since: int, limit: int = 20) -> list[LoggedMessage]:
+        """チャンネルでのある人の発言を、since 以降に限って古い順に返す。"""
+        rows = self.db.execute(
+            "SELECT * FROM messages WHERE channel_id = ? AND author_id = ? AND created_at >= ?"
+            " ORDER BY created_at DESC LIMIT ?",
+            (channel_id, user_id, since, limit),
+        ).fetchall()
+        return [self._row_to_message(r) for r in reversed(rows)]
