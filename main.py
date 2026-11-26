@@ -128,7 +128,7 @@ intents.message_content = True  # Developer Portal ã§ Message Content Intent ã‚
 
 class OniyaBot(discord.Client):
     def __init__(self, deepseek: DeepSeek, store: Store) -> None:
-        super().__init__(intents=intents, allowed_mentions=discord.AllowedMentions(everyone=False, roles=False))
+        super().__init__(intents=intents, allowed_mentions=discord.AllowedMentions(everyone=True, roles=True))
         self.tree = app_commands.CommandTree(self)
         self.deepseek = deepseek
         self.store = store
