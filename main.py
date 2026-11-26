@@ -67,7 +67,7 @@ def load_llm_config() -> LLMConfig:
         model=os.getenv("DEEPSEEK_MODEL", "deepseek-flash"),
         max_tokens=int(os.getenv("MAX_TOKENS", "16384")),
         max_continuations=int(os.getenv("MAX_CONTINUATIONS", "3")),
-        thinking=_bool_env("THINKING", False),
+        thinking=_bool_env("THINKING", True),
         web_search=_bool_env("WEB_SEARCH", True),
     )
 

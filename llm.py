@@ -31,7 +31,7 @@ class LLMConfig:
     max_tokens: int = 16384
     max_continuations: int = 3
     max_tool_rounds: int = 6
-    thinking: bool = False
+    thinking: bool = True  # 考えてから答えるモード。返事の要否の判定と要約では常にオフ
     web_search: bool = True
     fact_limit: int = 100  # システムの指示に入れる記憶の最大件数
     summary_limit: int = 10  # システムの指示に入れる過去の会話の要約の最大件数
