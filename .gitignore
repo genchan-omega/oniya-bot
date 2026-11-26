@@ -3,3 +3,6 @@
 __pycache__/
 *.pyc
 data/
+
+# 配信の書き起こし（返事の例を作るための元データ。bot は読まない。他人の著作物なので公開しない）
+profiles/*/examples/few-shot/
